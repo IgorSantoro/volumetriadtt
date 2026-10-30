@@ -1,7 +1,7 @@
 """Painel gerencial de solicitações da auditoria — Impostos Diretos.
 
 Executar:  streamlit run app.py
-Bases: arraste o(s) export(s) do portal na barra lateral ou salve-os na pasta ./bases
+Bases: o app lê automaticamente os exports salvos na pasta ./bases do repositório
 """
 from __future__ import annotations
 
@@ -16,8 +16,11 @@ from exportacao import gerar_excel
 from leitura import BaseAuditoria, ErroLeitura, ler_export
 
 # ============================== CONSTANTES ==============================
-PASTA_BASES = Path(__file__).parent / "bases"
+RAIZ = Path(__file__).resolve().parent          # pasta do app (= raiz do repositório no Streamlit Cloud)
+PASTA_BASES = RAIZ / "bases"
 EXTENSOES = ("xlsx", "xlsm", "xls")
+PASTAS_IGNORADAS = {".git", ".venv", "venv", "__pycache__", ".streamlit", "node_modules"}
+ASSINATURA_LFS = b"version https://git-lfs"
 TITULO_PAGINA = "Solicitações da Auditoria"
 
 st.set_page_config(page_title=TITULO_PAGINA, page_icon="📋", layout="wide")
@@ -31,22 +34,40 @@ def _ler_bytes(conteudo: bytes, nome: str) -> BaseAuditoria:
     return ler_export(BytesIO(conteudo), nome)
 
 
-def carregar_bases(enviados, ler_pasta: bool) -> tuple[list[BaseAuditoria], list[str]]:
-    bases, erros = [], []
-    fontes: list[tuple[bytes, str]] = [(f.getvalue(), f.name) for f in (enviados or [])]
-    if ler_pasta and PASTA_BASES.exists():
-        fontes += [(p.read_bytes(), p.name) for p in sorted(PASTA_BASES.iterdir())
-                   if p.suffix.lower().lstrip(".") in EXTENSOES and not p.name.startswith("~$")]
-    vistos = set()
-    for conteudo, nome in fontes:
+def _ignorar(p: Path) -> bool:
+    return any(parte in PASTAS_IGNORADAS for parte in p.relative_to(RAIZ).parts[:-1])
+
+
+def localizar_exports() -> list[Path]:
+    """Todos os Excel do repositório (bases/ primeiro, depois qualquer outra pasta)."""
+    achados = [p for p in RAIZ.rglob("*") if p.is_file() and not _ignorar(p)
+               and p.suffix.lower().lstrip(".") in EXTENSOES and not p.name.startswith("~$")]
+    return sorted(achados, key=lambda p: (PASTA_BASES not in p.parents, str(p).lower()))
+
+
+def listar_repositorio(limite: int = 60) -> list[str]:
+    itens = [str(p.relative_to(RAIZ)) for p in sorted(RAIZ.rglob("*")) if p.is_file() and not _ignorar(p)]
+    return itens[:limite]
+
+
+def carregar_bases(enviados) -> tuple[list[BaseAuditoria], list[str]]:
+    bases, avisos, vistos = [], [], set()
+    fontes: list[tuple[bytes, str, bool]] = [(f.getvalue(), f.name, True) for f in (enviados or [])]
+    fontes += [(p.read_bytes(), p.name, PASTA_BASES in p.parents) for p in localizar_exports()]
+    for conteudo, nome, obrigatorio in fontes:
         if nome in vistos:
             continue
         vistos.add(nome)
+        if conteudo.startswith(ASSINATURA_LFS):
+            avisos.append(f"{nome}: está salvo no GitHub via Git LFS (só o ponteiro chegou ao app). "
+                          "Suba o arquivo pelo navegador (Add file → Upload files) sem LFS.")
+            continue
         try:
             bases.append(_ler_bytes(conteudo, nome))
         except ErroLeitura as exc:
-            erros.append(f"{nome}: {exc}")
-    return bases, erros
+            if obrigatorio:  # Excel fora de bases/ que não é export é simplesmente ignorado
+                avisos.append(f"{nome}: {exc}")
+    return bases, avisos
 
 
 def fmt_num(v: float, casas: int = 0) -> str:
@@ -60,18 +81,22 @@ def fmt_volume(mb: float) -> str:
 # ============================== BARRA LATERAL ==============================
 with st.sidebar:
     st.markdown("### 📥 Bases")
-    enviados = st.file_uploader("Export(s) do portal da auditoria", type=list(EXTENSOES), accept_multiple_files=True)
-    ler_pasta = st.checkbox(f"Ler também a pasta /{PASTA_BASES.name}", value=True,
-                            help="Salve os exports nessa pasta para não precisar arrastar toda vez.")
+    with st.expander("Carregar outro export (opcional)"):
+        enviados = st.file_uploader("Export(s) do portal da auditoria", type=list(EXTENSOES),
+                                    accept_multiple_files=True, label_visibility="collapsed")
 
-bases, erros = carregar_bases(enviados, ler_pasta)
-for e in erros:
-    st.sidebar.error(e)
+bases, avisos = carregar_bases(enviados)
+for a in avisos:
+    st.sidebar.warning(a)
 
 if not bases:
     st.markdown(ui.cabecalho("—", pd.Timestamp.today(), 0), unsafe_allow_html=True)
-    st.info("Carregue o export de solicitações do portal da auditoria na barra lateral "
-            f"(ou salve o arquivo na pasta **{PASTA_BASES.name}/** ao lado do app).")
+    st.error("Nenhum export de solicitações foi encontrado no repositório.")
+    st.markdown(f"Salve o arquivo do portal (ex.: `Requests - Energisa 3ITR - FY26 out 30 2026.xlsx`) "
+                f"na pasta **bases/** do repositório, ao lado do `app.py`.")
+    with st.expander("🔧 Diagnóstico — o que o app está enxergando", expanded=True):
+        st.code(f"Pasta do app: {RAIZ}\nPasta bases existe: {PASTA_BASES.exists()}\n\n"
+                + "\n".join(listar_repositorio()), language="text")
     st.stop()
 
 ciclos = sorted({b.ciclo for b in bases})
